@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Game Launcher</title>
+        <style>
+            body {
+                background: #121212;
+                color: #e0e0e0;
+                font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                height: 100vh;
+                margin: 0;
+                overflow: hidden;
+            }
+
+            .container {
+                width: 350px;
+                text-align: left;
+            }
+
+            #status {
+                font-size: 14px;
+                font-weight: 500;
+                margin-bottom: 10px;
+                color: #fff;
+            }
+
+            #progress-wrapper {
+                width: 100%;
+                height: 8px;
+                background: #333;
+                border-radius: 4px;
+                overflow: hidden;
+            }
+
+            #fill {
+                background: #2196F3;
+                height: 100%;
+                width: 0%;
+                transition: width .3s ease;
+            }
+
+            #details {
+                margin-top: 10px;
+                display: flex;
+                justify-content: space-between;
+                font-size: 11px;
+                color: #888;
+                text-transform: uppercase;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div id="status">Preparing...</div>
+            <div id="progress-wrapper">
+                <div id="fill"></div>
+            </div>
+            <div id="details">
+                <span id="byte-count">0 MB / 0 MB</span>
+                <span id="eta">Estimating...</span>
+            </div>
+        </div>
+        <script>
+            const TOTAL_CHUNKS = 34;
+            const CDN_URL = "";
+            const BASE_NAME = "o.zip.part";
+
+            async function launch() {
+                const status = document.getElementById("status");
+                const fill = document.getElementById("fill");
+                const byteCount = document.getElementById("byte-count");
+                const eta = document.getElementById("eta");
+                const chunks = [];
+                let received = 0;
+                const started = Date.now();
+
+                try {
+                    // 1) Fetch every part, tracking bytes and ETA.
+                    for (let i = 1; i <= TOTAL_CHUNKS; i++) {
+                        const name = BASE_NAME + i;
+                        status.innerText = "Downloading " + name + "...";
+                        const res = await fetch(CDN_URL + name, { mode: "cors" });
+                        if (!res.ok) throw new Error("HTTP " + res.status + " fetching " + name);
+                        const buf = await res.arrayBuffer();
+                        chunks.push(buf);
+                        received += buf.byteLength;
+
+                        const pct = (i / TOTAL_CHUNKS) * 100;
+                        fill.style.width = pct + "%";
+                        const speed = received / ((Date.now() - started) / 1000);
+                        const expectedTotal = (received / i) * TOTAL_CHUNKS;
+                        const remaining = Math.max(0, Math.round((expectedTotal - received) / speed));
+                        byteCount.innerText = (received / 1048576).toFixed(1) + " MB / " + (expectedTotal / 1048576).toFixed(1) + " MB";
+                        eta.innerText = i === TOTAL_CHUNKS ? "Complete" : "About " + remaining + "s remaining";
+                    }
+
+                    // 2) Assemble the parts into one Blob (no whole-zip ArrayBuffer copy).
+                    status.innerText = "Extracting...";
+                    const zip = new Blob(chunks, { type: "application/zip" });
+
+                    // 3) Register the VFS service worker.
+                    if (!("serviceWorker" in navigator)) throw new Error("Service workers unsupported");
+                    await navigator.serviceWorker.register("sw.js", { scope: "/" });
+                    await navigator.serviceWorker.ready;
+                    let worker = navigator.serviceWorker.controller;
+
+                    if (!worker) {
+                        // First visit: the page must reload once so the worker takes control.
+                        // Stash the assembled zip in IndexedDB so the reload doesn't re-download.
+                        status.innerText = "Activating worker...";
+                        await stashZip(zip);
+                        sessionStorage.setItem("vfsResume", "1");
+                        window.location.reload();
+                        return;
+                    }
+
+                    await mountAndLaunch(worker, zip);
+                } catch (err) {
+                    status.innerText = "Error: " + err.message;
+                    status.style.color = "#ff5252";
+                    console.error(err);
+                }
+            }
+
+            async function mountAndLaunch(worker, zip) {
+                status_set("Mounting...");
+                const mounted = await new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => reject(new Error("VFS mount timed out")), 60000);
+                    navigator.serviceWorker.addEventListener("message", function onMsg(event) {
+                        const d = event.data || {};
+                        if (d.type === "MOUNTED") {
+                            clearTimeout(timer);
+                            navigator.serviceWorker.removeEventListener("message", onMsg);
+                            resolve(d);
+                        } else if (d.type === "MOUNT_ERROR") {
+                            clearTimeout(timer);
+                            navigator.serviceWorker.removeEventListener("message", onMsg);
+                            reject(new Error(d.error));
+                        }
+                    });
+                    worker.postMessage({ type: "MOUNT", data: zip });
+                });
+                document.getElementById("fill").style.width = "100%";
+                document.getElementById("eta").innerText = "Ready";
+                status.innerText = "Launching...";
+                window.location.href = "/virtual/index.html";
+            }
+
+            function status_set(text) {
+                document.getElementById("status").innerText = text;
+            }
+
+            // Tiny IndexedDB helpers: keep the assembled zip across the one
+            // activation reload (and future visits) without re-downloading.
+            function stashZip(blob) {
+                return new Promise((resolve, reject) => {
+                    const open = indexedDB.open("vfs-store", 1);
+                    open.onupgradeneeded = () => open.result.createObjectStore("kv");
+                    open.onerror = () => reject(open.error);
+                    open.onsuccess = () => {
+                        const tx = open.result.transaction("kv", "readwrite");
+                        tx.objectStore("kv").put(blob, "zip");
+                        tx.oncomplete = () => resolve();
+                        tx.onerror = () => reject(tx.error);
+                    };
+                });
+            }
+
+            function getStashedZip() {
+                return new Promise((resolve) => {
+                    const open = indexedDB.open("vfs-store", 1);
+                    open.onupgradeneeded = () => open.result.createObjectStore("kv");
+                    open.onerror = () => resolve(null);
+                    open.onsuccess = () => {
+                        const tx = open.result.transaction("kv", "readonly");
+                        const req = tx.objectStore("kv").get("zip");
+                        req.onsuccess = () => resolve(req.result || null);
+                        req.onerror = () => resolve(null);
+                    };
+                });
+            }
+
+        </script>
+        <script>
+            // Entry point: on load, either resume from the stashed zip (after the
+            // one-time worker-activation reload) or do the full part download.
+            window.addEventListener("load", async () => {
+                if (sessionStorage.getItem("vfsResume") === "1") {
+                    sessionStorage.removeItem("vfsResume");
+                    try {
+                        const zip = await getStashedZip();
+                        if (!zip) throw new Error("stashed zip missing");
+                        await navigator.serviceWorker.register("sw.js", { scope: "/" });
+                        await navigator.serviceWorker.ready;
+                        let worker = navigator.serviceWorker.controller;
+                        if (!worker) {
+                            // not controlled yet — give activation a beat, retry once
+                            await new Promise(r => setTimeout(r, 500));
+                            worker = navigator.serviceWorker.controller;
+                        }
+                        if (!worker) throw new Error("service worker not controlling page");
+                        await mountAndLaunch(worker, zip);
+                    } catch (err) {
+                        console.warn("Resume failed: " + err.message + " — falling back to full download");
+                        launch();
+                    }
+                } else {
+                    launch();
+                }
+            });
+        </script>
+    </body>
+</html>
