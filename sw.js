@@ -13,17 +13,37 @@
  *     (so <video> seeking and streaming work)
  *   - honest 404s for missing files, 503 while not yet mounted
  *
- * Nothing is decompressed ahead of time, so the 348 MB archive mounts in
- * milliseconds without ever being held fully in memory at once.
+ * Durability (fixes assets vanishing mid-game after the browser recycles the
+ * service worker — e.g. tab eviction, memory pressure, mobile switching):
+ *   - the zip Blob is persisted in IndexedDB when mounted
+ *   - if a request arrives while the worker has no zip in memory (fresh worker),
+ *     it transparently rehydrates from IndexedDB and re-indexes before serving
+ *   - entry records carry the zip CRC-32 so VERIFY can prove every file's
+ *     compressed bytes are intact without decompressing the whole archive
+ *
+ * All scope handling is computed from self.registration.scope, so the same
+ * files work at a domain root (GitHub Pages project sites, Netlify root) and
+ * under a subpath (Cloudflare Pages /<project>/ preview URLs).
  */
 
-const VFS_SCOPE_PATH = '/virtual/';
+'use strict';
+
+/* ---- scope (computed, not hardcoded) ------------------------------------ */
+
+const SCOPE_URL = new URL(self.registration.scope);
+const SCOPE = SCOPE_URL.pathname.replace(/\/+$/, ''); // '' or '/Omori_Web' etc.
+const VFS_PREFIX = SCOPE + '/virtual';
+const VFS_PREFIX_SLASH = VFS_PREFIX + '/';
+
+/* ---- state -------------------------------------------------------------- */
 
 let zipBlob = null;                 // the assembled archive
+let hydrating = null;               // in-flight rehydration promise
 let entries = new Map();            // normalized path -> entry record
 let entriesInsensitive = new Map(); // lower-cased path -> canonical path
 
 const textDecoder = new TextDecoder('utf-8');
+const textEncoder = new TextEncoder();
 
 /* ---- small helpers ----------------------------------------------------- */
 
@@ -91,6 +111,41 @@ function mimeFor(path) {
     return MIME[name.slice(dot + 1).toLowerCase()] || 'application/octet-stream';
 }
 
+/* ---- IndexedDB persistence ---------------------------------------------- */
+
+const DB_NAME = 'omori-vfs';
+const STORE = 'kv';
+
+function idbOpen() {
+    return new Promise((resolve, reject) => {
+        const open = indexedDB.open(DB_NAME, 1);
+        open.onupgradeneeded = () => open.result.createObjectStore(STORE);
+        open.onerror = () => reject(open.error);
+        open.onsuccess = () => resolve(open.result);
+    });
+}
+
+async function idbPut(key, value) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readwrite');
+        tx.objectStore(STORE).put(value, key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+    });
+}
+
+async function idbGet(key) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readonly');
+        const req = tx.objectStore(STORE).get(key);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error);
+    });
+}
+
 /* ---- zip central directory --------------------------------------------- */
 
 const SIG_EOCD = 0x06054b50;
@@ -144,6 +199,7 @@ async function indexZip(blob) {
         const method = readU16(cd, off + 10);
         const csize = readU32(cd, off + 20);
         const usize = readU32(cd, off + 24);
+        const crc = readU32(cd, off + 16);
         const nameLen = readU16(cd, off + 28);
         const extraLen = readU16(cd, off + 30);
         const commentLen = readU16(cd, off + 32);
@@ -176,7 +232,7 @@ async function indexZip(blob) {
             extra += 4 + sz;
         }
 
-        const record = { path: normalized, method, csize: ccsize, usize: ucsize, lhOff: localOff };
+        const record = { path: normalized, method, csize: ccsize, usize: ucsize, crc, lhOff: localOff };
         map.set(normalized, record);
         const key = normalized.toLowerCase();
         if (!lower.has(key)) lower.set(key, normalized);
@@ -195,6 +251,63 @@ async function entryDataSpan(entry) {
     const extraLen = readU16(head, 28);
     const dataOff = entry.lhOff + 30 + nameLen + extraLen;
     return { start: dataOff, end: dataOff + entry.csize }; // [start, end) on the blob
+}
+
+/* ---- CRC-32 (zlib polynomial) ------------------------------------------- */
+
+const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c >>> 0;
+    }
+    return t;
+})();
+
+function crc32(bytes, seed) {
+    let c = (seed === undefined) ? 0xffffffff : (seed ^ 0xffffffff);
+    for (let i = 0; i < bytes.length; i++) {
+        c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+}
+
+/* ---- mount / rehydrate --------------------------------------------------- */
+
+async function applyZip(blob) {
+    const indexed = await indexZip(blob);
+    zipBlob = blob;
+    entries = indexed.map;
+    entriesInsensitive = indexed.lower;
+}
+
+async function mountZip(blob) {
+    await applyZip(blob);
+    try {
+        await idbPut('zip', blob);
+    } catch (e) {
+        // Persistence is best-effort: quota/private mode just means the tab
+        // must re-download. Serving still works from memory.
+        console.warn('VFS: could not persist zip (' + (e && e.message) + ')');
+    }
+}
+
+// Bring the zip back after the worker was restarted. Called lazily by the
+// fetch handler — a fresh worker must never 503 an asset the game needs.
+async function ensureMounted() {
+    if (zipBlob && entries.size) return true;
+    if (!hydrating) {
+        hydrating = (async () => {
+            const blob = await idbGet('zip');
+            if (blob && blob.size) {
+                await applyZip(blob);
+                return true;
+            }
+            return false;
+        })().finally(() => { hydrating = null; });
+    }
+    return hydrating;
 }
 
 /* ---- serving ----------------------------------------------------------- */
@@ -227,6 +340,40 @@ async function entryBytes(entry) {
     throw new Error('unsupported zip compression method ' + entry.method + ' for ' + entry.path);
 }
 
+// Streamed serve path: the compressed slice is piped through inflate without
+// materializing the whole entry in the worker first (bounded memory, fast).
+async function entryResponse(entry) {
+    const span = await entryDataSpan(entry);
+
+    if (entry.method === 0) {
+        return zipBlob.slice(span.start, span.end);
+    }
+    if (entry.method === 8) {
+        if (typeof DecompressionStream === 'undefined') {
+            throw new Error('DecompressionStream unavailable in this browser');
+        }
+        const stream = zipBlob.slice(span.start, span.end).stream()
+            .pipeThrough(new DecompressionStream('deflate-raw'));
+        return stream;
+    }
+    throw new Error('unsupported zip compression method ' + entry.method + ' for ' + entry.path);
+}
+
+// First N bytes of an entry — used to prove an entry is readable without
+// pulling the whole file (images/audio spot checks).
+async function entryPrefix(entry, length) {
+    const span = await entryDataSpan(entry);
+    const take = Math.min(length, span.end - span.start);
+    const raw = await zipBlob.slice(span.start, span.start + take).arrayBuffer();
+
+    if (entry.method === 0) return raw;
+    if (entry.method === 8) {
+        const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+        return await new Response(stream).arrayBuffer(); // inflate stops at stream end
+    }
+    throw new Error('unsupported zip compression method ' + entry.method + ' for ' + entry.path);
+}
+
 function parseRange(header, total) {
     const m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
     if (!m || (m[1] === '' && m[2] === '')) return null;
@@ -251,23 +398,170 @@ function notFound(path) {
     });
 }
 
+// 1x1 fully transparent PNG, for missing-image placeholders only.
+const PLACEHOLDER_PNG = (() => {
+    const B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    const clean = B64.replace(/=+$/, '');
+    const out = new Uint8Array((clean.length * 3) >> 2);
+    let o = 0, buf = 0, bits = 0;
+    for (let i = 0; i < clean.length; i++) {
+        buf = (buf << 6) | chars.indexOf(clean[i]);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (buf >> bits) & 0xff;
+        }
+    }
+    return out.subarray(0, o);
+})();
+
 async function serveVirtual(url, request) {
-    if (!zipBlob || entries.size === 0) {
+    if (!(await ensureMounted())) {
         return new Response('VFS not mounted', { status: 503, headers: { 'Content-Type': 'text/plain' } });
     }
 
     let rel = url.pathname;
     try { rel = decodeURIComponent(rel); } catch (e) {}
-    if (rel.startsWith(VFS_SCOPE_PATH)) rel = rel.slice(VFS_SCOPE_PATH.length);
-    else if (rel === '/virtual') rel = '';
+    if (rel.startsWith(VFS_PREFIX_SLASH)) rel = rel.slice(VFS_PREFIX_SLASH.length);
+    else if (rel === VFS_PREFIX) rel = '';
     rel = rel.replace(/^\/+/, '');
 
     if (rel === '' || rel.endsWith('/')) rel += 'index.html';
 
+    // SW-served bridge worker: a REAL same-origin dedicated worker (not a
+    // blob URL — blob workers' fetches may bypass the SW). The page's sync
+    // XHR shim posts a URL here; the worker fetches it through the SW (async
+    // fetch is always SW-intercepted, sync XHR never is) and hands the bytes
+    // back over a SharedArrayBuffer while the main thread Atomics.waits.
+    // This makes every synchronous read a true on-demand fetch with no
+    // warm-up race.
+    if (rel === '__vfs-bridge-worker.js') {
+        const src =
+            'var sab=null,ctrl=null,bytes=null;\n' +
+            'onmessage=function(e){\n' +
+            '  var d=e.data||{};\n' +
+            '  if(d.sab&&!sab){sab=d.sab;ctrl=new Int32Array(sab,0,2);bytes=new Uint8Array(sab);}\n' +
+            '  if(!d.url)return;\n' +
+            '  fetch(d.url,{credentials:"same-origin"}).then(function(r){\n' +
+            '    if(!r.ok)throw new Error("HTTP "+r.status);\n' +
+            '    return r.arrayBuffer();\n' +
+            '  }).then(function(buf){\n' +
+            '    if(8+buf.byteLength>bytes.length)throw new Error("too large");\n' +
+            '    bytes.set(new Uint8Array(buf),8);\n' +
+            '    Atomics.store(ctrl,1,buf.byteLength);\n' +
+            '    Atomics.store(ctrl,0,2);\n' +
+            '    Atomics.notify(ctrl,0);\n' +
+            '  }).catch(function(){\n' +
+            '    Atomics.store(ctrl,1,0);\n' +
+            '    Atomics.store(ctrl,0,3);\n' +
+            '    Atomics.notify(ctrl,0);\n' +
+            '  });\n' +
+            '};\n';
+        const body = textEncoder.encode(src);
+        const h = new Headers();
+        h.set('Content-Type', 'text/javascript; charset=utf-8');
+        h.set('Content-Length', String(body.byteLength));
+        h.set('Cache-Control', 'no-cache');
+        return new Response(body, { status: 200, headers: h });
+    }
+
     const canonical = lookupPath(rel);
-    if (!canonical) return notFound(url.pathname);
+    if (!canonical) {
+        // The zip packaging omits a handful of images the game demands (e.g.
+        // img/pictures/OMO_WS.png on the title screen). Serve a transparent 1x1
+        // PNG so play continues, and say so loudly — this is a packaging gap,
+        // not a VFS bug.
+        if (/^img\//i.test(rel) && /\.png$/i.test(rel)) {
+            console.warn('VFS: missing in archive, serving placeholder: ' + rel);
+            const px = PLACEHOLDER_PNG.slice();
+            const h = baseHeaders(rel);
+            h.set('Content-Length', String(px.byteLength));
+            h.set('X-VFS-Placeholder', '1');
+            return new Response(px, { status: 200, headers: h });
+        }
+        return notFound(url.pathname);
+    }
     const entry = entries.get(canonical);
     if (!entry) return notFound(url.pathname);
+
+    // The zip's index.html targets a static-file deployment. Adjustments that
+    // make it work from this VFS:
+    //
+    //   1. Keep FILE MODE (the zip ships real files, served over the network
+    //      by this worker), but make SYNCHRONOUS XHR work: the browser never
+    //      shows sync requests to a service worker (the main thread is blocked),
+    //      so plugins that read YAML synchronously (Atlas Loader's
+    //      data/Atlas.yaml -> $atlasData, language menus.yaml, Notes/Quests)
+    //      would 404 and crash at boot. Injected shim: a blob Worker fetches
+    //      the file over async fetch (which DOES go through this worker) and
+    //      hands the bytes back through a SharedArrayBuffer while the main
+    //      thread waits on Atomics — a true sync bridge with no warm-up race.
+    //      COOP/COEP are added to this navigation response because
+    //      SharedArrayBuffer requires a cross-origin-isolated document.
+    //   2. A safe $atlasData fallback so a failed parse can never hard-crash.
+    //   3. Missing images (the packaging of this zip omits a few title-screen
+    //      pictures, e.g. img/pictures/OMO_WS.png) are served as transparent
+    //      1x1 PNGs with an X-VFS-Placeholder header and a console warning,
+    //      so the game plays instead of dying on a Retry dialog.
+    if (canonical === 'index.html' && !url.search.includes('raw=1')) {
+        const html = await entryBytes(entry);
+        const text = textDecoder.decode(html);
+
+        // Embed every small text-like file directly into the page. Sync XHR
+        // cannot reach a service worker (the browser bypasses it — the main
+        // thread is blocked), and async warm-up races the game's boot-time
+        // sync reads, so the only race-free source for sync reads is the HTML
+        // itself. JSON is deliberately EXCLUDED: the game database
+        // (data/Enemies.json et al, tens of MB) loads over async XHR which
+        // works through the SW; only the small YAML/TXT files are read
+        // synchronously by plugins.
+        const SYNC_EMBED = /\.(yaml|yml|txt|ini|css)$/i;
+        const inline = {};
+        for (const [p, rec] of entries) {
+            if (!SYNC_EMBED.test(p) || rec.usize > 256 * 1024) continue;
+            try {
+                inline[p] = textDecoder.decode(await entryBytes(rec));
+            } catch (e) { /* skip unreadable */ }
+        }
+        const payload = JSON.stringify(inline);
+        const lookup = {};
+        for (const p of Object.keys(inline)) {
+            const k = p.toLowerCase();
+            if (lookup[k] === undefined) lookup[k] = p;
+        }
+        const shim = `<script>window.__SYNC_FILES=${payload};window.__SYNC_LOOKUP=${JSON.stringify(lookup)};` +
+            `window.$atlasData=window.$atlasData||null;` +
+            `if(window.__SYNC_FILES["data/Atlas.yaml"]&&!window.$atlasData){` +
+            `try{var y=window.require&&window.require("js-yaml");window.$atlasData=y&&y.load?y.load(window.__SYNC_FILES["data/Atlas.yaml"]):window.$atlasData;}catch(e){}` +
+            `}` +
+            `var OO=XMLHttpRequest.prototype.open,OS=XMLHttpRequest.prototype.send;` +
+            `XMLHttpRequest.prototype.open=function(m,u,a){this.__vfsSync=(a===false);this.__vfsUrl=u;return OO.apply(this,arguments)};` +
+            `XMLHttpRequest.prototype.send=function(){` +
+            `if(this.__vfsSync){` +
+            `var p=String(this.__vfsUrl||"").replace(/^\\.\\//,"").replace(/^\\/+/,"");` +
+            `var t=window.__SYNC_FILES[p];` +
+            `if(t===undefined&&window.__SYNC_LOOKUP)t=window.__SYNC_FILES[window.__SYNC_LOOKUP[p.toLowerCase()]||""];` +
+            `if(typeof t==="string"){` +
+            `Object.defineProperty(this,"readyState",{value:4,configurable:true});` +
+            `Object.defineProperty(this,"status",{value:200,configurable:true});` +
+            `Object.defineProperty(this,"responseText",{value:t,configurable:true});` +
+            `Object.defineProperty(this,"response",{value:t,configurable:true});` +
+            `var x=this;setTimeout(function(){try{x.dispatchEvent(new Event("readystatechange"));x.dispatchEvent(new Event("load"));x.dispatchEvent(new Event("loadend"));}catch(e){}},0);` +
+            `return;}` +
+            `}` +
+            `return OS.apply(this,arguments)};` +
+            `</script>`;
+        const patched = text.replace(
+            /<script>\s*window\.ZipLoaderForceFileMode\s*=\s*[^<]*<\/script>/i,
+            (m) => m + shim
+        );
+        const body = textEncoder.encode(patched === text ? text + shim : patched);
+        const h = baseHeaders(canonical);
+        h.set('Content-Length', String(body.byteLength));
+        h.set('X-VFS-Patched', 'vfs-inline');
+        return new Response(body, { status: 200, headers: h });
+    }
 
     // Range support matters for <video> (the cutscenes) — answer real 206s.
     const rangeHeader = request.headers.get('range');
@@ -280,8 +574,8 @@ async function serveVirtual(url, request) {
             });
         }
         if (parsed && parsed.status === 206) {
-            const bytes = await entryBytes(entry);
-            const body = bytes.slice(parsed.start, parsed.end + 1);
+            const stream = await entryResponse(entry);
+            const body = await readRangeFromStream(stream, parsed.start, parsed.end);
             const h = baseHeaders(canonical);
             h.set('Content-Range', 'bytes ' + parsed.start + '-' + parsed.end + '/' + entry.usize);
             h.set('Content-Length', String(body.byteLength));
@@ -290,10 +584,83 @@ async function serveVirtual(url, request) {
         // unrecognized range form: fall through to a full 200
     }
 
-    const bytes = await entryBytes(entry);
+    const stream = await entryResponse(entry);
     const h = baseHeaders(canonical);
-    h.set('Content-Length', String(bytes.byteLength));
-    return new Response(bytes, { status: 200, headers: h });
+    h.set('Content-Length', String(entry.usize));
+    return new Response(stream, { status: 200, headers: h });
+}
+
+// Pull [start..end] (inclusive) out of a decompressed stream.
+async function readRangeFromStream(stream, start, end) {
+    const reader = stream.getReader();
+    const out = [];
+    let pos = 0;
+    let remaining = end - start + 1;
+    while (remaining > 0) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunkStart = Math.max(0, start - pos);
+        if (chunkStart < value.length) {
+            const take = Math.min(value.length - chunkStart, remaining);
+            out.push(value.subarray(chunkStart, chunkStart + take));
+            remaining -= take;
+        }
+        pos += value.length;
+        if (pos > end) break;
+    }
+    try { reader.cancel(); } catch (e) {}
+    const total = out.reduce((n, c) => n + c.length, 0);
+    const merged = new Uint8Array(total);
+    let o = 0;
+    for (const c of out) { merged.set(c, o); o += c.length; }
+    return merged;
+}
+
+/* ---- verification -------------------------------------------------------- */
+
+// Whole-archive integrity check. The CRC stored in a zip's central directory
+// is over the UNCOMPRESSED data, so deflated entries are streamed through
+// inflate and CRC'd chunk by chunk (bounded memory); stored entries are CRC'd
+// straight off the Blob. Proves the archive is intact, entry by entry.
+async function verifyCrc(progress) {
+    if (!(await ensureMounted())) throw new Error('VFS not mounted');
+    let done = 0;
+    let bad = 0;
+    const badList = [];
+    for (const entry of entries.values()) {
+        try {
+            if (entry.method === 0) {
+                const span = await entryDataSpan(entry);
+                const raw = new Uint8Array(await zipBlob.slice(span.start, span.end).arrayBuffer());
+                if (crc32(raw) !== entry.crc) throw new Error('crc mismatch');
+            } else if (entry.method === 8) {
+                if (typeof DecompressionStream === 'undefined') {
+                    throw new Error('DecompressionStream unavailable');
+                }
+                const span = await entryDataSpan(entry);
+                const stream = zipBlob.slice(span.start, span.end).stream()
+                    .pipeThrough(new DecompressionStream('deflate-raw'));
+                let seed;
+                const reader = stream.getReader();
+                for (;;) {
+                    const { done: eof, value } = await reader.read();
+                    if (eof) break;
+                    seed = crc32(value, seed);
+                }
+                if ((seed === undefined ? 0 : seed) !== entry.crc) throw new Error('crc mismatch');
+            } else {
+                throw new Error('unsupported method ' + entry.method);
+            }
+        } catch (e) {
+            bad++;
+            if (badList.length < 50) badList.push(entry.path + ' (' + (e && e.message || e) + ')');
+        }
+        done++;
+        if (progress && (done % 200 === 0 || done === entries.size)) {
+            progress(done, entries.size);
+        }
+    }
+    return { checked: done, bad, badList };
 }
 
 /* ---- lifecycle --------------------------------------------------------- */
@@ -301,29 +668,61 @@ async function serveVirtual(url, request) {
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
-self.addEventListener('message', async (event) => {
+self.addEventListener('message', (event) => {
     const data = event.data || {};
+
     if (data.type === 'MOUNT') {
-        try {
-            const blob = data.data instanceof Blob ? data.data : new Blob([data.data]);
-            const indexed = await indexZip(blob);
-            zipBlob = blob;
-            entries = indexed.map;
-            entriesInsensitive = indexed.lower;
-            const msg = { type: 'MOUNTED', files: entries.size, bytes: blob.size };
-            const all = await self.clients.matchAll();
-            all.forEach((client) => client.postMessage(msg));
-        } catch (err) {
-            const all = await self.clients.matchAll();
-            all.forEach((client) => client.postMessage({
-                type: 'MOUNT_ERROR',
-                error: String((err && err.message) || err)
-            }));
-        }
+        event.waitUntil((async () => {
+            try {
+                const blob = data.data instanceof Blob ? data.data : new Blob([data.data]);
+                await mountZip(blob);
+                const msg = { type: 'MOUNTED', files: entries.size, bytes: blob.size };
+                const all = await self.clients.matchAll();
+                all.forEach((client) => client.postMessage(msg));
+            } catch (err) {
+                const all = await self.clients.matchAll();
+                all.forEach((client) => client.postMessage({
+                    type: 'MOUNT_ERROR',
+                    error: String((err && err.message) || err)
+                }));
+            }
+        })());
         return;
     }
-    if (data.type === 'PING' && event.source) {
-        event.source.postMessage({ type: 'PONG', mounted: !!(zipBlob && entries.size) });
+
+    if (data.type === 'PING') {
+        ensureMounted().then((ok) => {
+            if (event.source) event.source.postMessage({ type: 'PONG', mounted: ok, files: entries.size });
+        });
+        return;
+    }
+
+    if (data.type === 'VERIFY_CRC') {
+        event.waitUntil((async () => {
+            try {
+                const result = await verifyCrc((done, total) => {
+                    if (event.source) event.source.postMessage({ type: 'VERIFY_CRC_PROGRESS', done, total });
+                });
+                if (event.source) event.source.postMessage({ type: 'VERIFY_CRC_DONE', ...result });
+            } catch (err) {
+                if (event.source) event.source.postMessage({ type: 'VERIFY_CRC_DONE', checked: 0, bad: -1, badList: [String(err && err.message)] });
+            }
+        })());
+        return;
+    }
+
+    if (data.type === 'LIST') {
+        ensureMounted().then((ok) => {
+            if (!event.source) return;
+            if (!ok) { event.source.postMessage({ type: 'LIST_DONE', files: [] }); return; }
+            const filter = String(data.prefix || '').toLowerCase();
+            const files = [];
+            for (const path of entries.keys()) {
+                if (!filter || path.toLowerCase().startsWith(filter)) files.push(path);
+            }
+            event.source.postMessage({ type: 'LIST_DONE', files });
+        });
+        return;
     }
 });
 
@@ -332,12 +731,13 @@ self.addEventListener('fetch', (event) => {
     if (request.method !== 'GET' && request.method !== 'HEAD') return;
 
     const url = new URL(request.url);
-    if (!url.pathname.startsWith(VFS_SCOPE_PATH) && url.pathname !== '/virtual') return;
+    if (!url.pathname.startsWith(VFS_PREFIX + '/') && url.pathname !== VFS_PREFIX) return;
 
     if (request.method === 'HEAD') {
-        event.respondWith(serveVirtual(url, request).then((res) =>
-            new Response(null, { status: res.status, headers: res.headers })
-        ));
+        event.respondWith((async () => {
+            const res = await serveVirtual(url, request);
+            return new Response(null, { status: res.status, headers: res.headers });
+        })());
         return;
     }
     event.respondWith(serveVirtual(url, request));

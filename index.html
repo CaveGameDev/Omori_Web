@@ -68,73 +68,68 @@
         </div>
         <script>
             const TOTAL_CHUNKS = 34;
-            const CDN_URL = "";
+            // Parts live next to this page; relative so root and subpath deploys both work.
             const BASE_NAME = "o.zip.part";
+            const IDB_NAME = "omori-vfs";
+            const VERIFY = {
+                // Every file in the archive is CRC-checked by the worker (cheap:
+                // compressed bytes only). On top of that we GET-probe a sample
+                // through the real /virtual/ serve path to prove the serving
+                // pipeline works for every asset type.
+                GET_PROBE: 40
+            };
 
-            async function launch() {
-                const status = document.getElementById("status");
-                const fill = document.getElementById("fill");
-                const byteCount = document.getElementById("byte-count");
-                const eta = document.getElementById("eta");
-                const chunks = [];
-                let received = 0;
-                const started = Date.now();
+            const el = (id) => document.getElementById(id);
+            const setStatus = (t) => { el("status").innerText = t; };
+            const setProgress = (pct) => { el("fill").style.width = Math.max(0, Math.min(100, pct)) + "%"; };
+            const setBytes = (t) => { el("byte-count").innerText = t; };
+            const setEta = (t) => { el("eta").innerText = t; };
 
-                try {
-                    // 1) Fetch every part, tracking bytes and ETA.
-                    for (let i = 1; i <= TOTAL_CHUNKS; i++) {
-                        const name = BASE_NAME + i;
-                        status.innerText = "Downloading " + name + "...";
-                        const res = await fetch(CDN_URL + name, { mode: "cors" });
-                        if (!res.ok) throw new Error("HTTP " + res.status + " fetching " + name);
-                        const buf = await res.arrayBuffer();
-                        chunks.push(buf);
-                        received += buf.byteLength;
-
-                        const pct = (i / TOTAL_CHUNKS) * 100;
-                        fill.style.width = pct + "%";
-                        const speed = received / ((Date.now() - started) / 1000);
-                        const expectedTotal = (received / i) * TOTAL_CHUNKS;
-                        const remaining = Math.max(0, Math.round((expectedTotal - received) / speed));
-                        byteCount.innerText = (received / 1048576).toFixed(1) + " MB / " + (expectedTotal / 1048576).toFixed(1) + " MB";
-                        eta.innerText = i === TOTAL_CHUNKS ? "Complete" : "About " + remaining + "s remaining";
-                    }
-
-                    // 2) Assemble the parts into one Blob (no whole-zip ArrayBuffer copy).
-                    status.innerText = "Extracting...";
-                    const zip = new Blob(chunks, { type: "application/zip" });
-
-                    // 3) Register the VFS service worker.
-                    if (!("serviceWorker" in navigator)) throw new Error("Service workers unsupported");
-                    await navigator.serviceWorker.register("sw.js", { scope: "/" });
-                    await navigator.serviceWorker.ready;
-                    let worker = navigator.serviceWorker.controller;
-
-                    if (!worker) {
-                        // First visit: the page must reload once so the worker takes control.
-                        // Stash the assembled zip in IndexedDB so the reload doesn't re-download.
-                        status.innerText = "Activating worker...";
-                        await stashZip(zip);
-                        sessionStorage.setItem("vfsResume", "1");
-                        window.location.reload();
-                        return;
-                    }
-
-                    await mountAndLaunch(worker, zip);
-                } catch (err) {
-                    status.innerText = "Error: " + err.message;
-                    status.style.color = "#ff5252";
-                    console.error(err);
-                }
+            function fail(message, details) {
+                console.error(message, details || "");
+                setStatus("Error: " + message);
+                el("status").style.color = "#ff5252";
+                setEta("Failed");
+                if (details && details.length) console.table ? console.table(details.slice(0, 30)) : null;
             }
 
-            async function mountAndLaunch(worker, zip) {
-                status_set("Mounting...");
-                const mounted = await new Promise((resolve, reject) => {
-                    const timer = setTimeout(() => reject(new Error("VFS mount timed out")), 60000);
-                    navigator.serviceWorker.addEventListener("message", function onMsg(event) {
+            /* ---- IndexedDB helpers (shared DB name with sw.js) ---- */
+            function idbOpen() {
+                return new Promise((resolve, reject) => {
+                    const open = indexedDB.open(IDB_NAME, 1);
+                    open.onupgradeneeded = () => open.result.createObjectStore("kv");
+                    open.onerror = () => reject(open.error);
+                    open.onsuccess = () => resolve(open.result);
+                });
+            }
+            async function idbPut(key, value) {
+                const db = await idbOpen();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction("kv", "readwrite");
+                    tx.objectStore("kv").put(value, key);
+                    tx.oncomplete = () => resolve();
+                    tx.onerror = () => reject(tx.error);
+                    tx.onabort = () => reject(tx.error);
+                });
+            }
+            async function idbGet(key) {
+                const db = await idbOpen();
+                return new Promise((resolve, reject) => {
+                    const tx = db.transaction("kv", "readonly");
+                    const req = tx.objectStore("kv").get(key);
+                    req.onsuccess = () => resolve(req.result || null);
+                    req.onerror = () => reject(req.error);
+                });
+            }
+
+            /* ---- SW plumbing ---- */
+            function swMessage(type, timeoutMs, onProgress) {
+                return new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => reject(new Error(type + " timed out")), timeoutMs);
+                    const onMsg = (event) => {
                         const d = event.data || {};
-                        if (d.type === "MOUNTED") {
+                        if (d.type === type + "_PROGRESS" && onProgress) { onProgress(d); return; }
+                        if (d.type === type + "_DONE") {
                             clearTimeout(timer);
                             navigator.serviceWorker.removeEventListener("message", onMsg);
                             resolve(d);
@@ -143,69 +138,234 @@
                             navigator.serviceWorker.removeEventListener("message", onMsg);
                             reject(new Error(d.error));
                         }
+                    };
+                    navigator.serviceWorker.addEventListener("message", onMsg);
+                    navigator.serviceWorker.controller.postMessage({ type });
+                });
+            }
+
+            async function getWorker() {
+                const reg = await navigator.serviceWorker.register("sw.js");
+                await navigator.serviceWorker.ready;
+                let worker = navigator.serviceWorker.controller;
+                if (!worker) {
+                    // Not controlled yet (first visit): reload once so it takes over.
+                    sessionStorage.setItem("vfsResume", "1");
+                    window.location.reload();
+                    return null;
+                }
+                return worker;
+            }
+
+            /* ---- verification ---- */
+            async function verifyAll() {
+                // 1) Worker-side: CRC every entry's compressed bytes against the
+                // central directory. Proves the stored archive is intact.
+                setStatus("Verifying archive integrity...");
+                const crc = await swMessage("VERIFY_CRC", 10 * 60 * 1000, (p) => {
+                    setProgress(20 + (p.done / Math.max(1, p.total)) * 60);
+                    setBytes(p.done + " / " + p.total + " files");
+                    setEta("CRC check");
+                });
+                if (crc.bad === -1) throw new Error("CRC verify failed: " + (crc.badList || []).join("; "));
+                if (crc.bad > 0) {
+                    throw new Error(crc.bad + " corrupt file(s) in archive: " + (crc.badList || []).slice(0, 10).join(", "));
+                }
+
+                // 2) Page-side: GET-probe a sample through the real serve path,
+                // including every file type the game loads at boot.
+                setStatus("Probing " + VERIFY.GET_PROBE + " files through /virtual/...");
+                const listMsg = await swMessage("LIST", 60000);
+                const files = listMsg.files || [];
+                if (!files.length) throw new Error("VFS reports no files");
+
+                const picks = [];
+                const byExt = {};
+                for (const f of files) {
+                    const ext = (f.split(".").pop() || "").toLowerCase();
+                    (byExt[ext] = byExt[ext] || []).push(f);
+                }
+                for (const ext of ["html", "js", "css", "json", "png", "ogg", "mp4", "ttf", "yaml", "txt"]) {
+                    const bucket = byExt[ext] || [];
+                    if (!bucket.length) continue;
+                    const stride = Math.max(1, Math.floor(bucket.length / 4));
+                    for (let i = 0; i < bucket.length && picks.length < VERIFY.GET_PROBE; i += stride) {
+                        picks.push(bucket[i]);
+                    }
+                }
+                // deterministic top-up if type coverage was thin
+                for (let i = 0; i < files.length && picks.length < VERIFY.GET_PROBE; i += Math.ceil(files.length / VERIFY.GET_PROBE)) {
+                    picks.push(files[i]);
+                }
+
+                const badProbes = [];
+                for (const path of picks) {
+                    try {
+                        const res = await fetch("virtual/" + encodePath(path));
+                        if (!res.ok) { badProbes.push(path + " -> HTTP " + res.status); continue; }
+                        const buf = await res.arrayBuffer();
+                        if (!buf.byteLength) badProbes.push(path + " -> empty body");
+                    } catch (e) {
+                        badProbes.push(path + " -> " + e.message);
+                    }
+                }
+                setProgress(85);
+                if (badProbes.length) {
+                    throw new Error(badProbes.length + " probe(s) failed: " + badProbes.slice(0, 10).join(" | "));
+                }
+                return files.length;
+            }
+
+            function encodePath(p) {
+                return p.split("/").map(encodeURIComponent).join("/");
+            }
+
+            /* ---- main flow ---- */
+            async function launch() {
+                try {
+                    const worker = await getWorker();
+                    if (!worker) return; // reloading for control
+
+                    // Fast path: worker already has the zip (rehydration from IDB
+                    // makes this survive worker restarts).
+                    const pong = await new Promise((resolve) => {
+                        const timer = setTimeout(() => resolve(null), 8000);
+                        const onMsg = (event) => {
+                            const d = event.data || {};
+                            if (d.type === "PONG") {
+                                clearTimeout(timer);
+                                navigator.serviceWorker.removeEventListener("message", onMsg);
+                                resolve(d);
+                            }
+                        };
+                        navigator.serviceWorker.addEventListener("message", onMsg);
+                        worker.postMessage({ type: "PING" });
                     });
-                    worker.postMessage({ type: "MOUNT", data: zip });
-                });
-                document.getElementById("fill").style.width = "100%";
-                document.getElementById("eta").innerText = "Ready";
-                status.innerText = "Launching...";
-                window.location.href = "/virtual/index.html";
+
+                    if (!pong || !pong.mounted) {
+                        // Full path: download all parts, assemble, mount.
+                        const zip = await downloadParts();
+                        setStatus("Mounting...");
+                        await new Promise((resolve, reject) => {
+                            const timer = setTimeout(() => reject(new Error("MOUNT timed out")), 120000);
+                            const onMsg = (event) => {
+                                const d = event.data || {};
+                                if (d.type === "MOUNTED") {
+                                    clearTimeout(timer);
+                                    navigator.serviceWorker.removeEventListener("message", onMsg);
+                                    resolve(d);
+                                } else if (d.type === "MOUNT_ERROR") {
+                                    clearTimeout(timer);
+                                    navigator.serviceWorker.removeEventListener("message", onMsg);
+                                    reject(new Error(d.error));
+                                }
+                            };
+                            navigator.serviceWorker.addEventListener("message", onMsg);
+                            worker.postMessage({ type: "MOUNT", data: zip });
+                        });
+                    } else {
+                        setStatus("Restored archive from cache");
+                    }
+
+                    const total = await verifyAll();
+
+                    setStatus("Launching...");
+                    setProgress(100);
+                    setBytes(total + " files verified");
+                    setEta("OK");
+                    window.location.href = "virtual/index.html";
+                } catch (err) {
+                    fail(err.message);
+                }
             }
 
-            function status_set(text) {
-                document.getElementById("status").innerText = text;
+            async function downloadParts() {
+                const chunks = [];
+                let received = 0;
+                const started = Date.now();
+                for (let i = 1; i <= TOTAL_CHUNKS; i++) {
+                    const name = BASE_NAME + i;
+                    setStatus("Downloading " + name + "...");
+                    const res = await fetch(name, { mode: "cors" });
+                    if (!res.ok) throw new Error("HTTP " + res.status + " fetching " + name);
+                    const buf = await res.arrayBuffer();
+                    chunks.push(buf);
+                    received += buf.byteLength;
+
+                    setProgress((i / TOTAL_CHUNKS) * 18);
+                    const speed = received / ((Date.now() - started) / 1000);
+                    const expectedTotal = (received / i) * TOTAL_CHUNKS;
+                    const remaining = Math.max(0, Math.round((expectedTotal - received) / speed));
+                    setBytes((received / 1048576).toFixed(1) + " MB / " + (expectedTotal / 1048576).toFixed(1) + " MB");
+                    setEta(i === TOTAL_CHUNKS ? "Complete" : "About " + remaining + "s remaining");
+                }
+                setStatus("Assembling...");
+                const zip = new Blob(chunks, { type: "application/zip" });
+                if (zip.size < 22) throw new Error("assembled zip is too small — parts are missing or empty");
+                return zip;
             }
 
-            // Tiny IndexedDB helpers: keep the assembled zip across the one
-            // activation reload (and future visits) without re-downloading.
-            function stashZip(blob) {
-                return new Promise((resolve, reject) => {
-                    const open = indexedDB.open("vfs-store", 1);
-                    open.onupgradeneeded = () => open.result.createObjectStore("kv");
-                    open.onerror = () => reject(open.error);
-                    open.onsuccess = () => {
-                        const tx = open.result.transaction("kv", "readwrite");
-                        tx.objectStore("kv").put(blob, "zip");
-                        tx.oncomplete = () => resolve();
-                        tx.onerror = () => reject(tx.error);
-                    };
-                });
-            }
-
-            function getStashedZip() {
-                return new Promise((resolve) => {
-                    const open = indexedDB.open("vfs-store", 1);
-                    open.onupgradeneeded = () => open.result.createObjectStore("kv");
-                    open.onerror = () => resolve(null);
-                    open.onsuccess = () => {
-                        const tx = open.result.transaction("kv", "readonly");
-                        const req = tx.objectStore("kv").get("zip");
-                        req.onsuccess = () => resolve(req.result || null);
-                        req.onerror = () => resolve(null);
-                    };
-                });
-            }
-
-        </script>
-        <script>
-            // Entry point: on load, either resume from the stashed zip (after the
-            // one-time worker-activation reload) or do the full part download.
+            /* ---- entry point ---- */
             window.addEventListener("load", async () => {
+                if (!("serviceWorker" in navigator)) { fail("Service workers unsupported"); return; }
+                try { await navigator.storage.persist(); } catch (e) {}
+
                 if (sessionStorage.getItem("vfsResume") === "1") {
                     sessionStorage.removeItem("vfsResume");
+                    // Reload happened so the worker could take control. Remount from
+                    // the persisted copy; if it is missing, fall back to download.
                     try {
-                        const zip = await getStashedZip();
-                        if (!zip) throw new Error("stashed zip missing");
-                        await navigator.serviceWorker.register("sw.js", { scope: "/" });
-                        await navigator.serviceWorker.ready;
-                        let worker = navigator.serviceWorker.controller;
-                        if (!worker) {
-                            // not controlled yet — give activation a beat, retry once
-                            await new Promise(r => setTimeout(r, 500));
-                            worker = navigator.serviceWorker.controller;
+                        const stashed = await idbGet("zip");
+                        if (!stashed) throw new Error("stashed zip missing");
+                        const worker = await (async () => {
+                            await navigator.serviceWorker.register("sw.js");
+                            await navigator.serviceWorker.ready;
+                            let w = navigator.serviceWorker.controller;
+                            if (!w) {
+                                await new Promise(r => setTimeout(r, 500));
+                                w = navigator.serviceWorker.controller;
+                            }
+                            if (!w) throw new Error("service worker not controlling page");
+                            return w;
+                        })();
+                        const pong = await new Promise((resolve) => {
+                            const timer = setTimeout(() => resolve(null), 8000);
+                            const onMsg = (event) => {
+                                const d = event.data || {};
+                                if (d.type === "PONG") {
+                                    clearTimeout(timer);
+                                    navigator.serviceWorker.removeEventListener("message", onMsg);
+                                    resolve(d);
+                                }
+                            };
+                            navigator.serviceWorker.addEventListener("message", onMsg);
+                            worker.postMessage({ type: "PING" });
+                        });
+                        if (!pong || !pong.mounted) {
+                            await new Promise((resolve, reject) => {
+                                const timer = setTimeout(() => reject(new Error("MOUNT timed out")), 120000);
+                                const onMsg = (event) => {
+                                    const d = event.data || {};
+                                    if (d.type === "MOUNTED") {
+                                        clearTimeout(timer);
+                                        navigator.serviceWorker.removeEventListener("message", onMsg);
+                                        resolve();
+                                    } else if (d.type === "MOUNT_ERROR") {
+                                        clearTimeout(timer);
+                                        navigator.serviceWorker.removeEventListener("message", onMsg);
+                                        reject(new Error(d.error));
+                                    }
+                                };
+                                navigator.serviceWorker.addEventListener("message", onMsg);
+                                worker.postMessage({ type: "MOUNT", data: stashed });
+                            });
                         }
-                        if (!worker) throw new Error("service worker not controlling page");
-                        await mountAndLaunch(worker, zip);
+                        const total = await verifyAll();
+                        setStatus("Launching...");
+                        setProgress(100);
+                        setBytes(total + " files verified");
+                        setEta("OK");
+                        window.location.href = "virtual/index.html";
                     } catch (err) {
                         console.warn("Resume failed: " + err.message + " — falling back to full download");
                         launch();
