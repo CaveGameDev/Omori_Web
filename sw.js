@@ -416,6 +416,67 @@ const PLACEHOLDER_PNG = (() => {
     return out.subarray(0, o);
 })();
 
+// Runtime patch layer: loose real files deployed next to this worker under
+// patch/ (real game paths mirrored below patch/). Served when the zip does
+// not contain the path. Files are cached per-session; failures are cached
+// too so a 404ing patch path does not refetch on every request.
+const patchCache = new Map(); // rel path (lower) -> Response-body bytes | null
+let patchManifestPromise = null; // lazy lowercase->actual-path map from patch/manifest.json
+function patchFileUrl(rel) {
+    // SCOPE is the directory containing sw.js (e.g. '/' or '/Omori_Web/'),
+    // so patch/<rel> sits next to index.html — works at root and subpaths.
+    return new URL(SCOPE.replace(/\/+$/, '') + '/patch/' + rel.split('/').map(encodeURIComponent).join('/'), SCOPE_URL.origin).href;
+}
+// Loose files are real filesystem names (case-sensitive on static hosts like
+// GitHub Pages) while the game may request any casing, so resolve through a
+// generated manifest: patch/manifest.json lists the exact deployed paths.
+async function patchManifest() {
+    if (!patchManifestPromise) {
+        patchManifestPromise = (async () => {
+            try {
+                const res = await fetch(new URL(SCOPE.replace(/\/+$/, '') + '/patch/manifest.json', SCOPE_URL.origin).href, { credentials: 'same-origin', cache: 'no-cache' });
+                if (!res.ok) return {};
+                const list = await res.json();
+                const map = {};
+                for (const p of Array.isArray(list) ? list : []) map[String(p).toLowerCase()] = p;
+                return map;
+            } catch (e) { return {}; }
+        })();
+    }
+    return patchManifestPromise;
+}
+async function servePatchFile(rel) {
+    const key = rel.toLowerCase();
+    if (patchCache.has(key)) {
+        const bytes = patchCache.get(key);
+        if (bytes === null) return null;
+        const h = baseHeaders(rel);
+        h.set('Content-Length', String(bytes.byteLength));
+        h.set('X-VFS-Patch', '1');
+        return new Response(bytes.slice(), { status: 200, headers: h });
+    }
+    try {
+        // Try the requested casing first, then the manifest's exact casing.
+        let res = await fetch(patchFileUrl(rel), { credentials: 'same-origin', cache: 'no-cache' });
+        if (!res.ok) {
+            const manifest = await patchManifest();
+            const actual = manifest[key];
+            if (actual && actual !== rel) res = await fetch(patchFileUrl(actual), { credentials: 'same-origin', cache: 'no-cache' });
+        }
+        if (!res.ok) { patchCache.set(key, null); return null; }
+        const buf = await res.arrayBuffer();
+        if (!buf.byteLength) { patchCache.set(key, null); return null; }
+        patchCache.set(key, buf);
+        const h = baseHeaders(rel);
+        h.set('Content-Length', String(buf.byteLength));
+        h.set('X-VFS-Patch', '1');
+        return new Response(buf.slice(0), { status: 200, headers: h });
+    } catch (e) {
+        patchCache.set(key, null);
+        return null;
+    }
+}
+
 async function serveVirtual(url, request) {
     if (!(await ensureMounted())) {
         return new Response('VFS not mounted', { status: 503, headers: { 'Content-Type': 'text/plain' } });
@@ -468,10 +529,20 @@ async function serveVirtual(url, request) {
 
     const canonical = lookupPath(rel);
     if (!canonical) {
-        // The zip packaging omits a handful of images the game demands (e.g.
-        // img/pictures/OMO_WS.png on the title screen). Serve a transparent 1x1
-        // PNG so play continues, and say so loudly — this is a packaging gap,
-        // not a VFS bug.
+        // Runtime patch layer: the archive omits a handful of real files
+        // (e.g. img/enemies/!battle_hero.png, img/system/loadscreen_backgrounds.png).
+        // They are shipped as loose files next to this worker under patch/
+        // (mirroring their in-game paths). Try the real file from the
+        // deployment root BEFORE falling back to the placeholder.
+        const patched = await servePatchFile(rel);
+        if (patched) return patched;
+
+        // Last resort for images the archive genuinely does not contain —
+        // atlas virtual paths (img/pictures/OMO_WS.png, sketchbook0-8.png, ...)
+        // are INTENTIONALLY absent: data/Atlas.yaml maps them onto real atlas
+        // textures. If you see placeholders for those here, the atlas data
+        // failed to load in the game (see the shim comment above), not the
+        // packaging. Serve a transparent 1x1 PNG so play continues.
         if (/^img\//i.test(rel) && /\.png$/i.test(rel)) {
             console.warn('VFS: missing in archive, serving placeholder: ' + rel);
             const px = PLACEHOLDER_PNG.slice();
@@ -531,10 +602,12 @@ async function serveVirtual(url, request) {
             if (lookup[k] === undefined) lookup[k] = p;
         }
         const shim = `<script>window.__SYNC_FILES=${payload};window.__SYNC_LOOKUP=${JSON.stringify(lookup)};` +
-            `window.$atlasData=window.$atlasData||null;` +
-            `if(window.__SYNC_FILES["data/Atlas.yaml"]&&!window.$atlasData){` +
-            `try{var y=window.require&&window.require("js-yaml");window.$atlasData=y&&y.load?y.load(window.__SYNC_FILES["data/Atlas.yaml"]):window.$atlasData;}catch(e){}` +
-            `}` +
+            // NOTE: deliberately DO NOT preset window.$atlasData here. The
+            // game's AtlasManager.initAtlasData() only runs when
+            // window.$atlasData === undefined; pre-setting it (even to null)
+            // skips that init, so every atlas-mapped path (title-screen
+            // OMO_*.png, sketchbook0-8, ...) falls through to direct requests
+            // that 404/placeholder and the whole title art goes invisible.
             `var OO=XMLHttpRequest.prototype.open,OS=XMLHttpRequest.prototype.send;` +
             `XMLHttpRequest.prototype.open=function(m,u,a){this.__vfsSync=(a===false);this.__vfsUrl=u;return OO.apply(this,arguments)};` +
             `XMLHttpRequest.prototype.send=function(){` +
